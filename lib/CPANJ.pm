@@ -12,6 +12,7 @@ package CPANJ {
     # use Archive::Extract;
     use Smart::Args;
     use Archive::Any::Lite; # ISHIGAKI ware
+    use Module::Metadata;
 
     use Mouse;
     our $VERSION = "0.01";
@@ -91,7 +92,18 @@ package CPANJ {
         },
     );
 
+    our $CONTEXT;
+
+    around 'new', sub {
+        my $orig = shift;
+        my $self = $orig->(@_);
+        $CONTEXT = $self;
+        return $self;
+    };
+
     no Mouse;
+
+    sub context { $CONTEXT }
 
     sub install {
         args my $self,
@@ -102,7 +114,18 @@ package CPANJ {
             c => $self,
         );
         $self->build_tree(tree => $tree, package => $package);
-        use Data::Dumper; warn Dumper($tree);
+        # use Data::Dumper; warn Dumper($tree);
+        warn join(", ", $tree->leaves);
+    }
+
+    sub is_installed {
+        args my $self, my $package, my $version;
+        my $module = Module::Metadata->new_from_module($package, collect_pod => 0);
+        if ($module) {
+            return version->new(eval { $module->version } || 0) >= version->parse($version);
+        } else {
+            return 0;
+        }
     }
 
     # supports only module name for now.
@@ -115,7 +138,7 @@ package CPANJ {
 
         return if $package eq 'perl';
 
-        if (eval("package Sandbox; use ${package} ${version}; 1;")) {
+        if ($self->is_installed(package => $package, version => $version)) {
             $self->logger->info("%s %s is already installed", $package, $version);
             return;
         } else {
@@ -132,25 +155,8 @@ package CPANJ {
             if ($dist) {
                 return if $dist->name eq 'perl';
 
-                my $meta = $self->fetch_meta(distribution => $dist, repository => $repository);
-                if (!$meta || $meta->dynamic_config) {
-                    # dynamic_config makes installation slow.
-                    # It's really slow.
-                    $self->logger->info("%s requires dynamic_config(version: %s, distfile: %s)", $package, $dist->version, $dist->distfile);
-
-                    if ($meta) {
-                        $self->install_configure_deps($meta);
-                    }
-
-                    my $workdir = $self->get_dist(
-                        distribution => $dist,
-                        repository => $repository,
-                    );
-                    $workdir->configure();
-                    $meta = $workdir->load_mymeta();
-                } else {
-                    $self->logger->debug("%s doesn't require dynamic_config", $package);
-                }
+                my $meta = $dist->meta()
+                    or die "Cannot fetch META information for ${package}";
 
                 my $prereqs = $meta->effective_prereqs->merged_requirements(
                     ['configure', 'build', 'runtime', ($self->test ? 'test' : ())],
@@ -170,73 +176,6 @@ package CPANJ {
             }
         }
         die "SHOULD NOT REACH HERE";
-    }
-
-    sub fetch_meta {
-        args my $self,
-            my $distribution => { isa => 'CPANJ::Distribution' },
-            my $repository,
-        ;
-
-        my $meta_url = $distribution->meta_url(repository => $repository);
-        my $res = $self->http_get($meta_url);
-        if ($res->is_success) {
-            if ($res->content =~ /\A\s*{/) {
-                CPAN::Meta->load_json_string($res->content);
-            } else {
-                CPAN::Meta->load_yaml_string($res->content);
-            }
-        } else {
-            # Some distribution does not include META.yml in distribution.
-            # e.g. XML::SAX::Base
-            $self->logger->warn("Cannot fetch %s: %s", $meta_url, $res->status_line);
-            return;
-        }
-    }
-
-    sub get_dist {
-        args my $self, my $distribution, my $repository;
-
-        my $local_path = $self->archive_cache_dir->child(
-            'authors/id',
-            $distribution->distfile,
-        );
-        $local_path->parent->mkpath;
-
-        unless (-f $local_path) {
-            $self->logger->info("Downloading %s", $distribution->distfile);
-
-            my $fh = IO::File::AtomicChange->new($local_path, 'w');
-            my $res = $self->ua->request(
-                url => $distribution->archive_url(repository => $repository),
-                write_file => $fh,
-            );
-            $res->is_success or die;
-            $fh->close;
-        }
-
-        local $Archive::Any::Lite::IGNORE_SYMLINK = 1; # for safety
-        my $archive = Archive::Any::Lite->new($local_path);
-        my $extract_dir = $self->workdir_base;
-        my $workdir_dir;
-        if ($archive->is_impolite) {
-            $extract_dir = $extract_dir->child($distribution->dist_name . '-' . $distribution->version);
-            $workdir_dir = $self->workdir_base->child($extract_dir->basename);
-        } else {
-            my $base = [File::Spec->splitdir([$archive->files]->[0])]->[0];
-            $workdir_dir = $self->workdir_base->child($base);
-        }
-        if ($archive->is_naughty) {
-            $self->error("%s is naughty.", $local_path);
-            die "ABORT\n";
-        }
-        $archive->extract($extract_dir)
-            or die $archive->error;
-        unless (-d $workdir_dir) {
-            # TODO bette diag
-            die "Cannot extract to $workdir_dir";
-        }
-        return CPANJ::WorkDir->new(c => $self, directory => $workdir_dir);
     }
 
     sub install_configure_deps {
@@ -259,7 +198,10 @@ package CPANJ {
 
     sub http_get {
         my ($self, $url) = @_;
-        $self->ua->get($url);
+        Carp::confess("Missing url") unless defined $url;
+        warn CPANJ->context;
+        CPANJ->context->logger->info("Getting %s", $url);
+        CPANJ->context->ua->get($url);
     }
 
     sub http_get_simple {
@@ -274,99 +216,161 @@ package CPANJ {
     }
 }
 
-package CPANJ::Index::MetaDB {
-    use YAML::Tiny;
+package CPANJ::Distribution {
+    use CPAN::DistnameInfo;
     use Smart::Args;
+    use CPANJ::Functions;
 
     use Mouse;
 
-    has c => (
-        is => 'rw',
+    has uri => (
+        is => 'ro',
+        isa => 'URI::cpan',
         required => 1,
+        handles => [qw(author)],
+    );
+
+    has mirror_uri => (
+        is       => 'ro',
+        isa      => 'Str',
+        required => 1,
+    );
+
+    has meta => (
+        is => 'ro',
+        isa => 'CPAN::Meta',
+        lazy => 1,
+        builder => '_build_meta',
+    );
+
+    has workdir => (
+        is => 'ro',
+        lazy => 1,
+        builder => '_build_workdir',
     );
 
     no Mouse;
 
-    # http://cpanmetadb.plackperl.org/v1.0/package/ExtUtils::CBuilder
+    sub name { shift->uri->dist_name }
 
-    # ---
-    # distfile: A/AM/AMBS/ExtUtils/ExtUtils-CBuilder-0.280212.tar.gz
-    # version: 0.280212
-
-    sub search_distribution_from_package_name {
-        args my $self, my $package_name => { isa => 'Str' };
-
-        my $url = "http://cpanmetadb.plackperl.org/v1.0/package/${package_name}";
-        my $res = $self->c->http_get($url);
-        if ($res->is_success) {
-            my $data = YAML::Tiny::Load($res->content);
-            my $dist = CPANJ::Distribution->new(
-                distfile => $data->{distfile},
-                version  => $data->{version},
-            );
-            return $dist;
-        } else {
-            if ($res->status eq '404') {
-                return undef;
-            } else {
-                $self->c->error("%s: %s", $url, $res->status_line);
-                die "ABORT";
-            }
-        }
+    sub _r_path {
+        my $self = shift;
+        my $path = $self->uri->path;
+        $path =~ s{^/\w+/}{};
+        $path;
     }
-}
 
-package CPANJ::Distribution {
-    use CPAN::DistnameInfo;
-    use Smart::Args;
-
-    use Mouse;
-
-    has distfile => (
-        is => 'ro',
-        isa => 'Str',
-        required => 1,
-    );
-
-    has version => (
-        is => 'ro',
-        isa => 'Str',
-        required => 1,
-    );
-
-    has _distname_info => (
-        is => 'ro',
-        lazy => 1,
-        default => sub { CPAN::DistnameInfo->new(shift->distfile) },
-    );
-
-    no  Mouse;
-
-    sub name { shift->_distname_info->dist }
+    sub _distname_info {
+        my $self = shift;
+        CPAN::DistnameInfo->new($self->_r_path);
+    }
 
     # http://ftp.riken.jp/lang/CPAN/authors/id/L/LD/LDS/AcePerl-1.92.meta
     sub meta_url {
-        args my $self, my $repository;
-        my $d = $self->_distname_info;
+        my $self = shift;
 
-        my $ext = $d->extension;
-        my $metafile = ($self->distfile =~ s/$ext\z/meta/r);
-
-        sprintf(
-            "%s/authors/id/%s",
-            $repository->mirror_uri,
-            $metafile
-        );
+        my $ext = $self->_distname_info->extension;
+        return ($self->archive_url =~ s/$ext\z/meta/r);
     }
 
     sub archive_url {
-        args my $self, my $repository;
+        my $self = shift;
+
+        my $mirror_uri = $self->mirror_uri;
+        $mirror_uri =~ s!/\z!!;
+        sprintf(
+            "%s/%s",
+            $mirror_uri, $self->pathname
+        );
+    }
+
+    sub pathname {
+        my $self = shift;
 
         sprintf(
-            "%s/authors/id/%s",
-            $repository->mirror_uri,
-            $self->distfile
+            "authors/id/%s/%s/%s",
+            substr($self->uri->author, 0, 1),
+            substr($self->uri->author, 0, 2),
+            $self->_r_path,
         );
+    }
+
+    sub _build_meta {
+        my $self = shift;
+
+        my $meta_url = $self->meta_url();
+        my $res = CPANJ->context->http_get($meta_url);
+        my $meta;
+        if ($res->is_success) {
+            if ($res->content =~ /\A\s*{/) {
+                $meta = CPAN::Meta->load_json_string($res->content);
+            } else {
+                $meta = CPAN::Meta->load_yaml_string($res->content);
+            }
+        } else {
+            # Some distribution does not include META.yml in distribution.
+            # e.g. XML::SAX::Base
+            $self->logger->warn("Cannot fetch %s: %s", $meta_url, $res->status_line);
+            return;
+        }
+
+        if ($meta && !$meta->dynamic_config) {
+            return $meta;
+        } else {
+            # dynamic_config makes installation slow.
+            # It's really slow.
+            logger->info("%s requires dynamic_config(version: %s)", $meta->name, $meta->version);
+
+            if ($meta) {
+                c->install_configure_deps($meta);
+            }
+
+            my $workdir = $self->workdir();
+            $workdir->configure();
+            return $workdir->load_mymeta();
+        }
+    }
+
+    sub _build_workdir {
+        my $self = shift;
+
+        my $local_path = c->archive_cache_dir->child($self->pathname);
+        $local_path->parent->mkpath;
+
+        unless (-f $local_path) {
+            $self->logger->info("Downloading %s", $self->pathname);
+
+            my $fh = IO::File::AtomicChange->new($local_path, 'w');
+            my $res = c->ua->request(
+                url => $self->archive_url(),
+                write_file => $fh,
+            );
+            $res->is_success or die;
+            $fh->close;
+        }
+
+        local $Archive::Any::Lite::IGNORE_SYMLINK = 1; # for safety
+        my $archive = Archive::Any::Lite->new($local_path);
+        my $extract_dir = c->workdir_base;
+        my $workdir_dir;
+        if ($archive->is_impolite) {
+            $extract_dir = $extract_dir->child($self->name . '-' . $self->version);
+            $workdir_dir = c->workdir_base->child($extract_dir->basename);
+        } else {
+            my $base = [File::Spec->splitdir([$archive->files]->[0])]->[0];
+            $workdir_dir = c->workdir_base->child($base);
+        }
+        if ($archive->is_naughty) {
+            $self->error("%s is naughty.", $local_path);
+            die "ABORT\n";
+        }
+        $archive->extract($extract_dir)
+            or die $archive->error;
+        unless (-d $workdir_dir) {
+            # TODO bette diag
+            die "Cannot extract to $workdir_dir";
+        }
+        return CPANJ::WorkDir->new(c => $self, directory => $workdir_dir);
     }
 }
 
@@ -447,13 +451,8 @@ package CPANJ::DependencyTree {
 
 package CPANJ::WorkDir {
     use File::pushd;
-    use Mouse;
 
-    has c => (
-        is => 'rw',
-        required => 1,
-        weak_ref => 1,
-    );
+    use Mouse;
 
     has directory => (
         is => 'ro',
@@ -474,7 +473,7 @@ package CPANJ::WorkDir {
             system($^X, 'Makefile.PL')
                 == 0 or die "ABORT\n";
         } else {
-            $self->c->logger->critical("There is no Build.PL or Makefile.PL: %s", $self->directory);
+            CPANJ->context->logger->critical("There is no Build.PL or Makefile.PL: %s", $self->directory);
             die "ABORT\n";
         }
     }
@@ -498,6 +497,8 @@ package CPANJ::Repository::Original {
     use URI::cpan;
     use CPAN::Meta;
     use Log::Pony;
+    use CPAN::Common::Index::MetaDB;
+    use Smart::Args;
 
     use Mouse;
 
@@ -512,9 +513,8 @@ package CPANJ::Repository::Original {
         lazy => 1,
         default => sub {
             my $self = shift;
-            CPANJ::Index::MetaDB->new(c => $self->c)
+            CPAN::Common::Index::MetaDB->new()
         },
-        handles => ['search_distribution_from_package_name'],
     );
 
     has mirror_uri => (
@@ -523,6 +523,19 @@ package CPANJ::Repository::Original {
     );
 
     no Mouse;
+
+    sub search_distribution_from_package_name {
+        args my $self, my $package_name;
+        my $result = $self->index->search_packages({package => $package_name});
+        if ($result) {
+            return CPANJ::Distribution->new(
+                uri        => URI->new($result->{uri}),
+                mirror_uri => $self->mirror_uri,
+            );
+        } else {
+            return undef;
+        }
+    }
 }
 
 

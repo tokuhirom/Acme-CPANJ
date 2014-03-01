@@ -1,0 +1,32 @@
+#!perl
+use strict;
+use warnings;
+use Pod::Usage;
+use CPANJ;
+use Getopt::Long;
+
+my $module = shift(@ARGV) or pod2usage;
+
+my $jobs = 2;
+my $p = Getopt::Long::Parser->new(
+    config => [qw(posix_default no_ignore_case auto_help)]
+);
+$p->getoptions(
+    'j=i' => \$jobs,
+);
+
+my $cpanj = CPANJ->new(
+    jobs => $jobs,
+);
+$cpanj->install(package => $module);
+
+__END__
+
+=head1 NAME
+
+cpanj - cpan with parallel execution
+
+=head1 SYNOPSIS
+
+    cpanj -j 4 Catalyst
+

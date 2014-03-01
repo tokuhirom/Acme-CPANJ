@@ -5,8 +5,6 @@ use warnings;
 
 our $VERSION = "0.01";
 
-
-
 1;
 __END__
 
@@ -22,7 +20,13 @@ Acme::CPANJ - It's new $module
 
 =head1 DESCRIPTION
 
-Acme::CPANJ is ...
+Acme::CPANJ is cpanm + parallel execution.
+
+This module aggregates module dependencies in parallel. And then, aggregate/install cpan modules.
+
+For now, cpanj does not supports DarkPAN.
+
+It's silly hack.
 
 =head1 LICENSE
 
